@@ -1,8 +1,7 @@
 #include <iostream>
 
-// ===== 解决方案步骤 1: 定义 NOMINMAX 来防止 Windows.h 定义 min/max 宏 =====
+// 定义 NOMINMAX 来防止 Windows.h 定义 min/max 宏
 #define NOMINMAX
-// =========================================================================
 
 #include <windows.h>
 #include <wincodec.h>
@@ -17,9 +16,8 @@
 #include <atomic>
 #include <functional>
 
-// ===== 解决方案步骤 2: 包含 <algorithm> 头文件以使用 std::max =====
+// 包含 <algorithm> 头文件以使用 std::max
 #include <algorithm>
-// =================================================================
 
 #pragma comment(lib, "windowscodecs.lib")
 #pragma comment(lib, "shlwapi.lib")
@@ -31,11 +29,12 @@ using Microsoft::WRL::ComPtr;
 HRESULT ConvertImageToHeic(const WCHAR* inputPath, const WCHAR* outputPath, float quality);
 void ShowHelp(const WCHAR* appName);
 bool IsSupportedImageFile(const std::wstring& fileName);
+bool CheckHevcEncoderAvailability(); // 新增的检测函数的前向声明
 
 // 用于保护控制台输出，防止多线程打印信息混乱
 std::mutex console_mutex;
 
-// 工作线程函数
+// 工作线程函数 (无改动)
 void Worker(
     const std::vector<std::wstring>* filesToProcess,
     const std::wstring* outputDir,
@@ -101,6 +100,23 @@ int wmain(int argc, wchar_t* argv[]) {
         wprintf(L"Failed to initialize COM. HR = 0x%X\n", hr);
         return 1;
     }
+
+    // ===== 新增修改：在程序早期调用检测函数 =====
+    if (!CheckHevcEncoderAvailability()) {
+        wprintf(L"\n错误：未在本系统上找到 HEIC 图像编码器。\n");
+        wprintf(L"此程序依赖于微软官方的“HEVC 视频扩展”才能运行。\n\n");
+        wprintf(L"请从 Microsoft Store 安装它。推荐先尝试免费版本：\n");
+        wprintf(L"1. (免费) 来自设备制造商的 HEVC 视频扩展:\n");
+        wprintf(L"   https://www.microsoft.com/store/productId/9N4WGH0Z6VHQ\n\n");
+        wprintf(L"2. (付费备用) HEVC 视频扩展:\n");
+        wprintf(L"   https://www.microsoft.com/store/productId/9NMZLZ57R3T7\n\n");
+        wprintf(L"安装后，请重新运行本程序。\n");
+
+        CoUninitialize();
+        system("pause"); // 暂停，以便用户能看到信息
+        return 1; // 检测失败后直接退出
+    }
+    // ===========================================
 
     if (argc <= 1) {
         ShowHelp(argv[0]);
@@ -239,6 +255,28 @@ int wmain(int argc, wchar_t* argv[]) {
 
 
 // --- 辅助函数实现 ---
+
+// ===== 新增修改：HEVC编码器可用性检测函数 =====
+bool CheckHevcEncoderAvailability() {
+    ComPtr<IWICImagingFactory> pFactory;
+    HRESULT hr = CoCreateInstance(
+        CLSID_WICImagingFactory,
+        nullptr,
+        CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&pFactory)
+    );
+    if (FAILED(hr)) {
+        // WIC工厂本身创建失败，这是严重的系统问题
+        return false;
+    }
+
+    ComPtr<IWICBitmapEncoder> pEncoder;
+    // 轻量地尝试创建HEIC编码器，如果成功，说明组件已安装
+    hr = pFactory->CreateEncoder(GUID_ContainerFormatHeif, NULL, &pEncoder);
+
+    return SUCCEEDED(hr);
+}
+// ===========================================
 
 void ShowHelp(const WCHAR* appName) {
     wprintf(L"HEIC Converter - Converts standard images to HEIC using Windows API.\n\n");

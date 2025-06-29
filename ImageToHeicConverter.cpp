@@ -1,8 +1,6 @@
 #include <iostream>
 
-// 定义 NOMINMAX 来防止 Windows.h 定义 min/max 宏
 #define NOMINMAX
-
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -15,8 +13,6 @@
 #include <mutex>
 #include <atomic>
 #include <functional>
-
-// 包含 <algorithm> 头文件以使用 std::max
 #include <algorithm>
 
 #pragma comment(lib, "windowscodecs.lib")
@@ -29,12 +25,11 @@ using Microsoft::WRL::ComPtr;
 HRESULT ConvertImageToHeic(const WCHAR* inputPath, const WCHAR* outputPath, float quality);
 void ShowHelp(const WCHAR* appName);
 bool IsSupportedImageFile(const std::wstring& fileName);
-bool CheckHevcEncoderAvailability(); // 新增的检测函数的前向声明
+bool CheckHevcEncoderAvailability();
 
-// 用于保护控制台输出，防止多线程打印信息混乱
 std::mutex console_mutex;
 
-// 工作线程函数 (无改动)
+// === 工作线程函数 (为未知错误增加错误码显示) ===
 void Worker(
     const std::vector<std::wstring>* filesToProcess,
     const std::wstring* outputDir,
@@ -43,7 +38,6 @@ void Worker(
     std::atomic<int>* fail_count,
     float quality
 ) {
-    // 每个使用COM的线程都必须自己初始化
     HRESULT hr_com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (FAILED(hr_com)) {
         std::lock_guard<std::mutex> lock(console_mutex);
@@ -52,35 +46,71 @@ void Worker(
     }
 
     while (true) {
-        // 原子地获取并增加任务索引，这是线程安全的
         size_t index = task_index->fetch_add(1);
-
-        // 如果索引超出任务列表范围，说明所有任务都已分配完毕
         if (index >= filesToProcess->size()) {
             break;
         }
 
         const std::wstring& inputFile = (*filesToProcess)[index];
-
-        // 构建输出路径
         const WCHAR* fileName = PathFindFileNameW(inputFile.c_str());
-        WCHAR outPath[MAX_PATH];
-        PathCchCombine(outPath, MAX_PATH, outputDir->c_str(), fileName);
-        PathCchRenameExtension(outPath, MAX_PATH, L".heic");
 
-        // 执行转换
-        HRESULT hr = ConvertImageToHeic(inputFile.c_str(), outPath, quality);
+        WCHAR finalOutPath[MAX_PATH];
+        PathCchCombine(finalOutPath, MAX_PATH, outputDir->c_str(), fileName);
+        PathCchRenameExtension(finalOutPath, MAX_PATH, L".heic");
 
-        // 使用互斥锁保护控制台输出
+        std::wstring tempOutPath = std::wstring(finalOutPath) + L".tmp";
+
+        HRESULT hr = ConvertImageToHeic(inputFile.c_str(), tempOutPath.c_str(), quality);
+
+        bool final_success = false;
+        std::wstring status_message;
+
+        if (SUCCEEDED(hr)) {
+            DeleteFileW(finalOutPath);
+            if (MoveFileW(tempOutPath.c_str(), finalOutPath)) {
+                final_success = true;
+                status_message = L"OK";
+            }
+            else {
+                DWORD lastError = GetLastError();
+                if (lastError == ERROR_ACCESS_DENIED) {
+                    status_message = L"FAILED (Permission Denied to Finalize)";
+                }
+                else {
+                    wchar_t buffer[64];
+                    swprintf_s(buffer, 64, L"FAILED (Move Error: %lu)", lastError);
+                    status_message = buffer;
+                }
+                DeleteFileW(tempOutPath.c_str());
+            }
+        }
+        else {
+            if (hr == E_ACCESSDENIED) {
+                status_message = L"FAILED (Permission Denied)";
+            }
+            else if (hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL)) {
+                status_message = L"FAILED (Disk Full)";
+            }
+            else if (hr == WINCODEC_ERR_BADHEADER) {
+                status_message = L"FAILED (Corrupt Input File)";
+            }
+            else {
+                wchar_t buffer[64];
+                swprintf_s(buffer, 64, L"FAILED (Code: 0x%08X)", static_cast<unsigned int>(hr));
+                status_message = buffer;
+            }
+
+            DeleteFileW(tempOutPath.c_str());
+        }
+
         {
             std::lock_guard<std::mutex> lock(console_mutex);
             wprintf(L"[%zu/%zu] Converting %s ... %s\n",
                 index + 1, filesToProcess->size(), PathFindFileNameW(inputFile.c_str()),
-                SUCCEEDED(hr) ? L"OK" : L"FAILED");
+                status_message.c_str());
         }
 
-        // 使用原子操作更新计数器
-        if (SUCCEEDED(hr)) {
+        if (final_success) {
             success_count->fetch_add(1);
         }
         else {
@@ -88,136 +118,61 @@ void Worker(
         }
     }
 
-    // 每个线程结束前必须释放自己初始化的COM
     CoUninitialize();
 }
 
-// 主程序入口
 int wmain(int argc, wchar_t* argv[]) {
-    // 主线程COM初始化
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr)) {
-        wprintf(L"Failed to initialize COM. HR = 0x%X\n", hr);
-        return 1;
-    }
+    if (FAILED(hr)) { wprintf(L"Failed to initialize COM. HR = 0x%X\n", hr); return 1; }
 
-    // ===== 新增修改：在程序早期调用检测函数 =====
     if (!CheckHevcEncoderAvailability()) {
-        wprintf(L"\n错误：未在本系统上找到 HEIC 图像编码器。\n");
-        wprintf(L"此程序依赖于微软官方的“HEVC 视频扩展”才能运行。\n\n");
-        wprintf(L"请从 Microsoft Store 安装它。推荐先尝试免费版本：\n");
-        wprintf(L"1. (免费) 来自设备制造商的 HEVC 视频扩展:\n");
+        wprintf(L"\nError: HEIC image encoder component is unavailable or not fully functional on this system.\n");
+        wprintf(L"This program requires the official \"HEVC Video Extensions\" to work correctly.\n\n");
+        wprintf(L"Please install it from the Microsoft Store. Trying the free version first is recommended:\n");
+        wprintf(L"1. (Free) HEVC Video Extensions from Device Manufacturer:\n");
         wprintf(L"   https://www.microsoft.com/store/productId/9N4WGH0Z6VHQ\n\n");
-        wprintf(L"2. (付费备用) HEVC 视频扩展:\n");
+        wprintf(L"2. (Paid Alternative) HEVC Video Extensions:\n");
         wprintf(L"   https://www.microsoft.com/store/productId/9NMZLZ57R3T7\n\n");
-        wprintf(L"安装后，请重新运行本程序。\n");
-
+        wprintf(L"After installation, please run this program again.\n");
         CoUninitialize();
-        system("pause"); // 暂停，以便用户能看到信息
-        return 1; // 检测失败后直接退出
-    }
-    // ===========================================
-
-    if (argc <= 1) {
-        ShowHelp(argv[0]);
-        CoUninitialize();
+        system("pause");
         return 1;
     }
+
+    if (argc <= 1) { ShowHelp(argv[0]); CoUninitialize(); return 1; }
 
     std::vector<std::wstring> inputPaths;
     std::wstring outputDir;
-    float quality = -1.0f; // -1.0 作为哨兵值，表示使用默认质量
-
-    // 解析命令行参数
+    float quality = -1.0f;
     for (int i = 1; i < argc; ++i) {
         std::wstring arg = argv[i];
-        if (arg == L"-h" || arg == L"--help") {
-            ShowHelp(argv[0]);
-            CoUninitialize();
-            return 0;
-        }
-        if (arg == L"-i" || arg == L"--input") {
-            while (i + 1 < argc && argv[i + 1][0] != L'-') {
-                inputPaths.push_back(argv[++i]);
-            }
-        }
-        else if (arg == L"-o" || arg == L"--output") {
-            if (i + 1 < argc) {
-                outputDir = argv[++i];
-            }
-        }
-        else if (arg == L"-q" || arg == L"--quality") {
-            if (i + 1 < argc) {
-                try {
-                    quality = std::stof(argv[++i]) / 100.0f;
-                    if (quality < 0.0f || quality > 1.0f) {
-                        wprintf(L"Warning: Quality must be between 0 and 100. Using default.\n");
-                        quality = -1.0f;
-                    }
-                }
-                catch (const std::exception&) {
-                    wprintf(L"Warning: Invalid quality value. It must be a number. Using default.\n");
-                    quality = -1.0f;
-                }
-            }
-        }
+        if (arg == L"-h" || arg == L"--help") { ShowHelp(argv[0]); CoUninitialize(); return 0; }
+        if (arg == L"-i" || arg == L"--input") { while (i + 1 < argc && argv[i + 1][0] != L'-') { inputPaths.push_back(argv[++i]); } }
+        else if (arg == L"-o" || arg == L"--output") { if (i + 1 < argc) { outputDir = argv[++i]; } }
+        else if (arg == L"-q" || arg == L"--quality") { if (i + 1 < argc) { try { quality = std::stof(argv[++i]) / 100.0f; if (quality < 0.0f || quality > 1.0f) { wprintf(L"Warning: Quality must be between 0 and 100. Using default quality.\n"); quality = -1.0f; } } catch (const std::exception&) { wprintf(L"Warning: Invalid quality value. It must be a number. Using default quality.\n"); quality = -1.0f; } } }
     }
 
-    if (inputPaths.empty() || outputDir.empty()) {
-        wprintf(L"Error: Both input and output paths must be specified.\n\n");
-        ShowHelp(argv[0]);
-        CoUninitialize();
-        return 1;
-    }
-
-    if (GetFileAttributesW(outputDir.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        if (!CreateDirectoryW(outputDir.c_str(), NULL)) {
-            wprintf(L"Error: Failed to create output directory: %s\n", outputDir.c_str());
-            CoUninitialize();
-            return 1;
-        }
-    }
+    if (inputPaths.empty() || outputDir.empty()) { wprintf(L"\nError: Both input and output paths must be specified.\n\n"); ShowHelp(argv[0]); CoUninitialize(); return 1; }
+    if (GetFileAttributesW(outputDir.c_str()) == INVALID_FILE_ATTRIBUTES) { if (!CreateDirectoryW(outputDir.c_str(), NULL)) { wprintf(L"Error: Failed to create output directory: %s\n", outputDir.c_str()); CoUninitialize(); return 1; } }
 
     std::vector<std::wstring> filesToProcess;
     for (const auto& path : inputPaths) {
         DWORD attributes = GetFileAttributesW(path.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES) {
-            wprintf(L"Warning: Input path not found, skipping: %s\n", path.c_str());
-            continue;
-        }
+        if (attributes == INVALID_FILE_ATTRIBUTES) { wprintf(L"Warning: Input path not found, skipping: %s\n", path.c_str()); continue; }
         if (attributes & FILE_ATTRIBUTE_DIRECTORY) {
             std::wstring searchPath = path + L"\\*";
             WIN32_FIND_DATAW findData;
             HANDLE hFind = FindFirstFileW(searchPath.c_str(), &findData);
             if (hFind != INVALID_HANDLE_VALUE) {
-                do {
-                    if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
-                        std::wstring fullPath = path + L"\\" + findData.cFileName;
-                        if (IsSupportedImageFile(fullPath)) {
-                            filesToProcess.push_back(fullPath);
-                        }
-                    }
-                } while (FindNextFileW(hFind, &findData) != 0);
+                do { if (!(findData.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) { std::wstring fullPath = path + L"\\" + findData.cFileName; if (IsSupportedImageFile(fullPath)) { filesToProcess.push_back(fullPath); } } } while (FindNextFileW(hFind, &findData) != 0);
                 FindClose(hFind);
             }
         }
-        else {
-            if (IsSupportedImageFile(path)) {
-                filesToProcess.push_back(path);
-            }
-            else {
-                wprintf(L"Warning: Unsupported file type, skipping: %s\n", path.c_str());
-            }
-        }
+        else { if (IsSupportedImageFile(path)) { filesToProcess.push_back(path); } else { wprintf(L"Warning: Unsupported file type, skipping: %s\n", path.c_str()); } }
     }
 
-    if (filesToProcess.empty()) {
-        wprintf(L"No supported image files found to process.\n");
-        CoUninitialize();
-        return 0;
-    }
+    if (filesToProcess.empty()) { wprintf(L"\nNo supported image files found to process.\n"); CoUninitialize(); return 0; }
 
-    // 并行处理逻辑
     SYSTEM_INFO sysInfo;
     GetSystemInfo(&sysInfo);
     const unsigned int num_threads = std::max(1u, (unsigned int)sysInfo.dwNumberOfProcessors);
@@ -228,55 +183,41 @@ int wmain(int argc, wchar_t* argv[]) {
     std::atomic<int> fail_count(0);
 
     std::vector<std::thread> threads;
-    for (unsigned int i = 0; i < num_threads; ++i) {
-        threads.emplace_back(
-            Worker,
-            &filesToProcess,
-            &outputDir,
-            &task_index,
-            &success_count,
-            &fail_count,
-            quality
-        );
-    }
-
-    for (auto& t : threads) {
-        if (t.joinable()) {
-            t.join();
-        }
-    }
+    for (unsigned int i = 0; i < num_threads; ++i) { threads.emplace_back(Worker, &filesToProcess, &outputDir, &task_index, &success_count, &fail_count, quality); }
+    for (auto& t : threads) { if (t.joinable()) { t.join(); } }
 
     wprintf(L"\nConversion finished. %d successful, %d failed.\n", success_count.load(), fail_count.load());
-
-    // 主线程释放COM
     CoUninitialize();
     return 0;
 }
 
-
-// --- 辅助函数实现 ---
-
-// ===== 新增修改：HEVC编码器可用性检测函数 =====
 bool CheckHevcEncoderAvailability() {
     ComPtr<IWICImagingFactory> pFactory;
-    HRESULT hr = CoCreateInstance(
-        CLSID_WICImagingFactory,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(&pFactory)
-    );
-    if (FAILED(hr)) {
-        // WIC工厂本身创建失败，这是严重的系统问题
-        return false;
-    }
-
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory));
+    if (FAILED(hr)) return false;
     ComPtr<IWICBitmapEncoder> pEncoder;
-    // 轻量地尝试创建HEIC编码器，如果成功，说明组件已安装
     hr = pFactory->CreateEncoder(GUID_ContainerFormatHeif, NULL, &pEncoder);
-
-    return SUCCEEDED(hr);
+    if (FAILED(hr)) return false;
+    ComPtr<IStream> pStream;
+    hr = CreateStreamOnHGlobal(NULL, TRUE, &pStream);
+    if (FAILED(hr)) return false;
+    hr = pEncoder->Initialize(pStream.Get(), WICBitmapEncoderNoCache);
+    if (FAILED(hr)) return false;
+    ComPtr<IWICBitmapFrameEncode> pFrameEncode;
+    ComPtr<IPropertyBag2> pPropertyBag;
+    hr = pEncoder->CreateNewFrame(&pFrameEncode, &pPropertyBag);
+    if (FAILED(hr)) return false;
+    hr = pFrameEncode->Initialize(pPropertyBag.Get());
+    if (FAILED(hr)) return false;
+    ComPtr<IWICBitmap> pBitmap;
+    hr = pFactory->CreateBitmap(1, 1, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &pBitmap);
+    if (FAILED(hr)) return false;
+    hr = pFrameEncode->WriteSource(pBitmap.Get(), NULL);
+    if (FAILED(hr)) return false;
+    hr = pFrameEncode->Commit();
+    if (FAILED(hr)) return false;
+    return true;
 }
-// ===========================================
 
 void ShowHelp(const WCHAR* appName) {
     wprintf(L"HEIC Converter - Converts standard images to HEIC using Windows API.\n\n");
@@ -295,16 +236,10 @@ void ShowHelp(const WCHAR* appName) {
 }
 
 bool IsSupportedImageFile(const std::wstring& fileName) {
-    const std::vector<std::wstring> supportedExtensions = {
-        L".jpg", L".jpeg", L".png", L".bmp", L".tiff", L".gif"
-    };
+    const std::vector<std::wstring> supportedExtensions = { L".jpg", L".jpeg", L".png", L".bmp", L".tiff", L".gif" };
     std::wstring extension = PathFindExtensionW(fileName.c_str());
     CharLowerW(&extension[0]);
-    for (const auto& ext : supportedExtensions) {
-        if (extension == ext) {
-            return true;
-        }
-    }
+    for (const auto& ext : supportedExtensions) { if (extension == ext) { return true; } }
     return false;
 }
 
@@ -313,57 +248,43 @@ HRESULT ConvertImageToHeic(const WCHAR* inputPath, const WCHAR* outputPath, floa
     ComPtr<IWICImagingFactory> pFactory;
     hr = CoCreateInstance(CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory));
     if (FAILED(hr)) return hr;
-
     ComPtr<IWICBitmapDecoder> pDecoder;
     hr = pFactory->CreateDecoderFromFilename(inputPath, NULL, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &pDecoder);
     if (FAILED(hr)) return hr;
-
     ComPtr<IWICBitmapFrameDecode> pFrameDecode;
     hr = pDecoder->GetFrame(0, &pFrameDecode);
     if (FAILED(hr)) return hr;
-
     ComPtr<IWICStream> pStream;
     hr = pFactory->CreateStream(&pStream);
     if (FAILED(hr)) return hr;
     hr = pStream->InitializeFromFilename(outputPath, GENERIC_WRITE);
     if (FAILED(hr)) return hr;
-
     ComPtr<IWICBitmapEncoder> pEncoder;
     hr = pFactory->CreateEncoder(GUID_ContainerFormatHeif, NULL, &pEncoder);
     if (FAILED(hr)) return hr;
-
     hr = pEncoder->Initialize(pStream.Get(), WICBitmapEncoderNoCache);
     if (FAILED(hr)) return hr;
-
     ComPtr<IWICBitmapFrameEncode> pFrameEncode;
     ComPtr<IPropertyBag2> pPropertyBag;
     hr = pEncoder->CreateNewFrame(&pFrameEncode, &pPropertyBag);
     if (FAILED(hr)) return hr;
-
     if (quality >= 0.0f && quality <= 1.0f) {
         PROPBAG2 option = { 0 };
         wchar_t propName[] = L"ImageQuality";
         option.pstrName = propName;
-
         VARIANT varValue;
         VariantInit(&varValue);
         varValue.vt = VT_R4;
         varValue.fltVal = quality;
         hr = pPropertyBag->Write(1, &option, &varValue);
-        if (FAILED(hr)) {
-            //
-        }
+        if (FAILED(hr)) { /* Warning can be logged here if needed */ }
     }
-
     hr = pFrameEncode->Initialize(pPropertyBag.Get());
     if (FAILED(hr)) return hr;
-
     hr = pFrameEncode->WriteSource(pFrameDecode.Get(), NULL);
     if (FAILED(hr)) return hr;
-
     hr = pFrameEncode->Commit();
     if (FAILED(hr)) return hr;
-
     hr = pEncoder->Commit();
     return hr;
 }
